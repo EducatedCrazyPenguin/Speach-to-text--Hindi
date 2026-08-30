@@ -6,6 +6,13 @@ __pycache__/
 models/
 recordings/
 transcripts/
+corrections/
+.jobs/
+benchmarks/gold-10min/
+benchmarks/promoted.json
+training/data/
+training/*.nemo
+training/*.ckpt
 .env
 .env.*
 *.token

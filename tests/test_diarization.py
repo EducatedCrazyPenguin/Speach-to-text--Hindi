@@ -1,5 +1,11 @@
-from voice_to_text.core import Segment
-from voice_to_text.diarization import SpeakerTurn, assign_speakers, merge_speaker_turns
+from voice_to_text.core import Segment, WordTiming
+from voice_to_text.diarization import (
+    SpeakerTurn,
+    assign_speakers,
+    assign_word_speakers,
+    merge_speaker_turns,
+    smooth_speaker_turns,
+)
 
 
 def test_assigns_two_speakers_by_overlap_and_first_appearance() -> None:
@@ -35,3 +41,32 @@ def test_merges_nearby_same_speaker_turns_but_not_other_speakers() -> None:
         SpeakerTurn(2.0, 3.0, "B"),
         SpeakerTurn(3.1, 4.0, "A"),
     )
+
+
+def test_assigns_speakers_after_asr_and_marks_real_overlap() -> None:
+    words = (
+        WordTiming(0.0, 0.8, "हाँ"),
+        WordTiming(0.8, 1.6, "माँ"),
+    )
+    segments = (Segment(0.0, 1.6, "हाँ माँ", words=words),)
+    exclusive = (SpeakerTurn(0.0, 0.8, "A"), SpeakerTurn(0.8, 1.6, "B"))
+    raw = (
+        SpeakerTurn(0.0, 1.3, "A"),
+        SpeakerTurn(0.7, 1.6, "B"),
+    )
+
+    labelled = assign_word_speakers(segments, exclusive, raw, ("Mohit", "Mum"))
+
+    assert [item.speaker for item in labelled] == ["Mohit", "Mum"]
+    assert labelled[1].overlap is True
+
+
+def test_smooths_sub_300ms_flip_and_joins_sub_350ms_gap() -> None:
+    turns = (
+        SpeakerTurn(0.0, 1.0, "A"),
+        SpeakerTurn(1.0, 1.2, "B"),
+        SpeakerTurn(1.2, 2.0, "A"),
+        SpeakerTurn(2.3, 3.0, "A"),
+    )
+
+    assert smooth_speaker_turns(turns) == (SpeakerTurn(0.0, 3.0, "A"),)

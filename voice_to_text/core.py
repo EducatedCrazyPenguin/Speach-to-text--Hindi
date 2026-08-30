@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 LANGUAGES: dict[str, str | None] = {
@@ -34,8 +34,9 @@ LANGUAGES: dict[str, str | None] = {
 }
 
 ENGINE_CHOICES: dict[str, str] = {
+    "Maximum local accuracy (SraVaani TDT)": "sravaani",
     "Whisper - best for mixed Hindi + English": "whisper",
-    "AI4Bharat IndicConformer - one Indian language": "indicconformer",
+    "Legacy AI4Bharat 120M CTC": "indicconformer",
 }
 
 MODEL_CHOICES: dict[str, str] = {
@@ -75,6 +76,19 @@ INDICCONFORMER_MODELS: dict[str, str] = {
 
 ProgressCallback = Callable[[str, float | None], None]
 _DLL_HANDLES: list[object] = []
+SRAVAANI_MODEL = "OpenVoiceOS/artpark-iisc-vaani-fastconformer-multi-onnx"
+
+
+@dataclass(frozen=True)
+class WordTiming:
+    """A recognized word with validated timing and optional speaker metadata."""
+
+    start: float
+    end: float
+    text: str
+    confidence: float | None = None
+    speaker: str | None = None
+    overlap: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,6 +97,9 @@ class Segment:
     end: float
     text: str
     speaker: str | None = None
+    confidence: float | None = None
+    overlap: bool = False
+    words: tuple[WordTiming, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -94,6 +111,9 @@ class TranscriptionResult:
     language_probability: float
     duration: float
     segments: tuple[Segment, ...]
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    provenance: tuple[str, ...] = ()
+    readable_text: str | None = None
 
     @property
     def text(self) -> str:
@@ -195,16 +215,21 @@ class Transcriber:
             self.device = "cpu"
 
     def _load_indicconformer(self, language: str | None) -> None:
-        if not language:
+        if self.engine == "indicconformer" and not language:
             raise ValueError(
                 "AI4Bharat IndicConformer needs a selected Indian language; Auto-detect is unavailable."
             )
-        if language == "en":
+        if self.engine == "indicconformer" and language == "en":
             raise ValueError("AI4Bharat IndicConformer does not include English. Use Whisper for English.")
-        model_id = INDICCONFORMER_MODELS.get(language)
+        model_id = (
+            SRAVAANI_MODEL
+            if self.engine == "sravaani"
+            else INDICCONFORMER_MODELS.get(str(language))
+        )
         if not model_id:
             raise ValueError(f"No IndicConformer model is configured for language '{language}'.")
-        if self._model is not None and self._loaded_language == language:
+        loaded_key = f"{self.engine}:{language or 'multi'}"
+        if self._model is not None and self._loaded_language == loaded_key:
             return
 
         try:
@@ -232,7 +257,11 @@ class Transcriber:
 
         _notify(
             self.progress_callback,
-            f"Loading AI4Bharat {language} model on {selected_device}. First run downloads it...",
+            (
+                f"Loading SraVaani TDT on {selected_device}. First run downloads about 1 GB..."
+                if self.engine == "sravaani"
+                else f"Loading AI4Bharat {language} model on {selected_device}. First run downloads it..."
+            ),
             0.02,
         )
         vad = onnx_asr.load_vad("silero", providers=providers)
@@ -240,13 +269,13 @@ class Transcriber:
         self._model = base_model.with_vad(
             vad,
             batch_size=4,
-            # Phone conversations benefit from shorter, cleaner utterances. Long
-            # chunks tend to join two speakers and make CTC decoding drop words.
-            min_silence_duration_ms=300,
-            max_speech_duration_s=15,
-            speech_pad_ms=150,
-        )
-        self._loaded_language = language
+            # Long context materially helps conversational Hindi. Padding on both
+            # sides also creates a 1.5 s overlap when VAD splits long speech.
+            min_silence_duration_ms=500,
+            max_speech_duration_s=25,
+            speech_pad_ms=750,
+        ).with_timestamps()
+        self._loaded_language = loaded_key
         self.device = selected_device
 
     @staticmethod
@@ -283,7 +312,7 @@ class Transcriber:
         if not source.is_file():
             raise FileNotFoundError(f"Recording not found: {source}")
 
-        if self.engine == "indicconformer":
+        if self.engine in {"indicconformer", "sravaani"}:
             return self._transcribe_indicconformer(source, language)
 
         self._load_whisper()
@@ -344,7 +373,29 @@ class Transcriber:
                     continue
                 end = min(end, duration)
             if text and end > start:
-                segments.append(Segment(start, end, text))
+                words: list[WordTiming] = []
+                for word in getattr(raw, "words", ()) or ():
+                    word_start = max(start, float(getattr(word, "start", start)))
+                    word_end = min(end, float(getattr(word, "end", end)))
+                    word_text = str(getattr(word, "word", "")).strip()
+                    if word_text and word_end > word_start:
+                        words.append(
+                            WordTiming(
+                                word_start,
+                                word_end,
+                                word_text,
+                                float(getattr(word, "probability", 0.0) or 0.0),
+                            )
+                        )
+                segments.append(
+                    Segment(
+                        start,
+                        end,
+                        text,
+                        confidence=float(getattr(raw, "avg_logprob", 0.0) or 0.0),
+                        words=tuple(words),
+                    )
+                )
             if duration:
                 progress = min(0.98, max(0.05, float(raw.end) / duration))
                 _notify(self.progress_callback, f"Transcribed {raw.end:.0f} of {duration:.0f} seconds", progress)
@@ -372,17 +423,38 @@ class Transcriber:
         segments: list[Segment] = []
         for raw in self._model.recognize(waveform, sample_rate=16_000, channel="mean"):
             text = str(raw.text).strip()
+            if self.engine == "sravaani" and language == "hi":
+                from .scripts import to_devanagari
+
+                text = to_devanagari(text)
             if text:
-                segments.append(Segment(float(raw.start), float(raw.end), text))
+                from .alignment import token_timings_to_words
+
+                start, end = float(raw.start), float(raw.end)
+                segments.append(
+                    Segment(
+                        start,
+                        end,
+                        text,
+                        words=token_timings_to_words(
+                            text=text,
+                            start=start,
+                            end=end,
+                            tokens=getattr(raw, "tokens", None),
+                            timestamps=getattr(raw, "timestamps", None),
+                            logprobs=getattr(raw, "logprobs", None),
+                        ),
+                    )
+                )
             progress = min(0.98, max(0.08, float(raw.end) / duration)) if duration else None
             _notify(self.progress_callback, f"Transcribed through {raw.end:.0f} seconds", progress)
 
         _notify(self.progress_callback, "Transcription complete", 1.0)
         return TranscriptionResult(
             source=source,
-            model=INDICCONFORMER_MODELS[str(language)],
+            model=(SRAVAANI_MODEL if self.engine == "sravaani" else INDICCONFORMER_MODELS[str(language)]),
             device=self.device,
-            language=str(language),
+            language=str(language or "hi/multilingual"),
             language_probability=1.0,
             duration=duration,
             segments=tuple(segments),

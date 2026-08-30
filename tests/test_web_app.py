@@ -129,3 +129,47 @@ def test_audio_copy_retention_is_explicit(
 
     assert source.exists() is should_exist
     assert app_module.JOBS[job_id]["status"] == "done"
+
+
+def test_corrections_are_saved_as_training_eligible_whole_call_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    transcripts = tmp_path / "transcripts"
+    recordings = tmp_path / "recordings"
+    corrections = tmp_path / "corrections"
+    transcripts.mkdir()
+    recordings.mkdir()
+    source = recordings / "call.wav"
+    source.write_bytes(b"audio")
+    transcript = transcripts / "call.transcript.json"
+    transcript.write_text(
+        json.dumps(
+            {
+                "source": str(source),
+                "duration_seconds": 3.0,
+                "segments": [],
+                "text": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "TRANSCRIPTS_DIR", transcripts)
+    monkeypatch.setattr(app_module, "RECORDINGS_DIR", recordings)
+    monkeypatch.setattr(app_module, "CORRECTIONS_DIR", corrections)
+
+    client = app.test_client()
+    response = client.put(
+        "/api/corrections/call.transcript.json",
+        json={
+            "segments": [{"start": 0, "end": 2.5, "speaker": "Mum", "text": "हाँ माँ", "overlap": False}],
+            "tags": {"dialect": "Hindi + dialect", "noise": "Telephone narrowband"},
+        },
+    )
+
+    assert response.status_code == 200
+    saved = json.loads(next(corrections.glob("*.json")).read_text(encoding="utf-8"))
+    assert saved["correction_metadata"]["training_eligible"] is True
+    assert saved["correction_metadata"]["split_group"] == "call.wav"
+    assert saved["segments"][0]["speaker"] == "Mum"

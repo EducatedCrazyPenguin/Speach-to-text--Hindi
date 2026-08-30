@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from voice_to_text.core import Segment, TranscriptionResult
+from voice_to_text.core import Segment, TranscriptionResult, WordTiming
 from voice_to_text.exports import timestamp, write_outputs
 
 
@@ -21,7 +21,7 @@ def test_writes_utf8_transcript_subtitles_and_json(tmp_path: Path) -> None:
         language_probability=0.98,
         duration=4.0,
         segments=(
-            Segment(0.0, 1.5, "नमस्ते", "Mohit"),
+            Segment(0.0, 1.5, "नमस्ते", "Mohit", words=(WordTiming(0.0, 1.5, "नमस्ते", 0.9, "Mohit"),)),
             Segment(2.0, 3.5, "Hello", "Wife"),
         ),
     )
@@ -36,3 +36,6 @@ def test_writes_utf8_transcript_subtitles_and_json(tmp_path: Path) -> None:
     assert data["text"] == "नमस्ते Hello"
     assert data["segments"][1]["start"] == 2.0
     assert data["segments"][1]["speaker"] == "Wife"
+    assert data["segments"][0]["words"][0]["confidence"] == 0.9
+    assert outputs["verbatim"].is_file()
+    assert outputs["readable"].is_file()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .core import Segment, TranscriptionResult
+from .core import Segment, TranscriptionResult, WordTiming
 
 
 def timestamp(seconds: float, *, srt: bool = False) -> str:
@@ -27,7 +27,8 @@ def _text_document(result: TranscriptionResult) -> str:
     ]
     for segment in result.segments:
         speaker = f"{segment.speaker}: " if segment.speaker else ""
-        lines.append(f"[{timestamp(segment.start)}] {speaker}{segment.text}")
+        overlap = "[overlap] " if segment.overlap else ""
+        lines.append(f"[{timestamp(segment.start)}] {speaker}{overlap}{segment.text}")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -42,8 +43,8 @@ def _srt_document(segments: tuple[Segment, ...]) -> str:
     return "\n\n".join(blocks).rstrip() + "\n"
 
 
-def _json_document(result: TranscriptionResult) -> str:
-    payload = {
+def result_to_dict(result: TranscriptionResult) -> dict:
+    return {
         "source": str(result.source),
         "model": result.model,
         "device": result.device,
@@ -51,11 +52,75 @@ def _json_document(result: TranscriptionResult) -> str:
         "language_probability": result.language_probability,
         "duration_seconds": result.duration,
         "text": result.text,
+        "readable_text": result.readable_text,
+        "diagnostics": dict(result.diagnostics),
+        "provenance": list(result.provenance),
         "segments": [
-            {"start": item.start, "end": item.end, "text": item.text, "speaker": item.speaker}
+            {
+                "start": item.start,
+                "end": item.end,
+                "text": item.text,
+                "speaker": item.speaker,
+                "confidence": item.confidence,
+                "overlap": item.overlap,
+                "words": [
+                    {
+                        "start": word.start,
+                        "end": word.end,
+                        "text": word.text,
+                        "confidence": word.confidence,
+                        "speaker": word.speaker,
+                        "overlap": word.overlap,
+                    }
+                    for word in item.words
+                ],
+            }
             for item in result.segments
         ],
     }
+
+
+def result_from_dict(payload: dict) -> TranscriptionResult:
+    segments = []
+    for item in payload.get("segments", []):
+        words = tuple(
+            WordTiming(
+                start=float(word["start"]),
+                end=float(word["end"]),
+                text=str(word["text"]),
+                confidence=word.get("confidence"),
+                speaker=word.get("speaker"),
+                overlap=bool(word.get("overlap", False)),
+            )
+            for word in item.get("words", [])
+        )
+        segments.append(
+            Segment(
+                start=float(item["start"]),
+                end=float(item["end"]),
+                text=str(item["text"]),
+                speaker=item.get("speaker"),
+                confidence=item.get("confidence"),
+                overlap=bool(item.get("overlap", False)),
+                words=words,
+            )
+        )
+    return TranscriptionResult(
+        source=Path(payload["source"]),
+        model=str(payload.get("model", "unknown")),
+        device=str(payload.get("device", "unknown")),
+        language=str(payload.get("language", "unknown")),
+        language_probability=float(payload.get("language_probability", 0.0)),
+        duration=float(payload.get("duration_seconds", 0.0)),
+        segments=tuple(segments),
+        diagnostics=payload.get("diagnostics", {}),
+        provenance=tuple(payload.get("provenance", [])),
+        readable_text=payload.get("readable_text"),
+    )
+
+
+def _json_document(result: TranscriptionResult) -> str:
+    payload = result_to_dict(result)
     return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
 
@@ -74,7 +139,8 @@ def _markdown_document(result: TranscriptionResult) -> str:
     ]
     for segment in result.segments:
         speaker = f" **{segment.speaker}:**" if segment.speaker else ""
-        lines.append(f"- `{timestamp(segment.start)}`{speaker} {segment.text}")
+        overlap = " `[overlap]`" if segment.overlap else ""
+        lines.append(f"- `{timestamp(segment.start)}`{speaker}{overlap} {segment.text}")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -84,11 +150,19 @@ def write_outputs(result: TranscriptionResult, output_dir: str | Path) -> dict[s
     stem = f"{result.source.stem}.transcript"
     paths = {
         "txt": destination / f"{stem}.txt",
+        "verbatim": destination / f"{result.source.stem}.verbatim.txt",
+        "readable": destination / f"{result.source.stem}.readable.txt",
         "srt": destination / f"{stem}.srt",
         "json": destination / f"{stem}.json",
         "md": destination / f"{stem}.md",
     }
     paths["txt"].write_text(_text_document(result), encoding="utf-8")
+    paths["verbatim"].write_text(_text_document(result), encoding="utf-8")
+    readable = result.readable_text or result.text
+    paths["readable"].write_text(
+        f"Source: {result.source.name}\nType: readable standard-Hindi copy\n\n{readable.strip()}\n",
+        encoding="utf-8",
+    )
     paths["srt"].write_text(_srt_document(result.segments), encoding="utf-8")
     paths["json"].write_text(_json_document(result), encoding="utf-8")
     paths["md"].write_text(_markdown_document(result), encoding="utf-8")
