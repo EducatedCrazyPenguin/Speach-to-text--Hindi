@@ -1,0 +1,4 @@
+faster-whisper>=1.1,<2
+flask>=3,<4
+onnx-asr[hub]>=0.10,<1
+onnxruntime>=1.23.2,<1.24

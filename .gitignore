@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+models/
+recordings/
+transcripts/
+.env
+.env.*
+*.token
+*.log
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
+*.opus
+*.aac
+*.wma
+*.mp4
+*.mov
+*.webm
+*.transcript.*
+Speach to text -Hindi/
