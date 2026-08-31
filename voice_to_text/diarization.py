@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import os
 import gc
+import math
+import os
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -19,6 +20,30 @@ class SpeakerTurn:
     start: float
     end: float
     speaker: str
+
+
+def _choose_pitch_label(
+    pitch_hz: float | None,
+    references: dict[str, float],
+) -> str | None:
+    """Choose a speaker only when two call-level pitch centers are distinct."""
+    if pitch_hz is None or not math.isfinite(pitch_hz) or pitch_hz <= 0 or len(references) < 2:
+        return None
+    candidates = sorted(
+        (
+            (abs(math.log2(pitch_hz / reference)), label)
+            for label, reference in references.items()
+            if math.isfinite(reference) and reference > 0
+        )
+    )
+    if len(candidates) < 2:
+        return None
+    best_distance, best_label = candidates[0]
+    second_distance, second_label = candidates[1]
+    separation = abs(math.log2(references[best_label] / references[second_label]))
+    if separation < 0.25 or best_distance > 0.22 or second_distance - best_distance < 0.15:
+        return None
+    return best_label
 
 
 def _overlap(segment: Segment, turn: SpeakerTurn) -> float:
@@ -171,6 +196,16 @@ def refine_speaker_words_with_embeddings(
         profile_names.append(name)
         profile_vectors.append(vector)
     profiles = np.vstack(profile_vectors) if profile_vectors else np.empty((0, centroids.shape[1]))
+    single_profile_anchor: int | None = None
+    if len(profiles) == 1 and len(centroids) >= 2:
+        anchor_scores = centroids @ profiles[0]
+        anchor_order = np.argsort(anchor_scores)[::-1]
+        anchor_best, anchor_second = int(anchor_order[0]), int(anchor_order[1])
+        if (
+            float(anchor_scores[anchor_best]) >= 0.30
+            and float(anchor_scores[anchor_best] - anchor_scores[anchor_second]) >= 0.08
+        ):
+            single_profile_anchor = anchor_best
 
     groups: list[list[WordTiming]] = []
     for word in words:
@@ -193,10 +228,11 @@ def refine_speaker_words_with_embeddings(
         left = max(0, int((group[0].start - 0.04) * sample_rate))
         right = min(len(waveform), int((group[-1].end + 0.04) * sample_rate))
         crop = np.asarray(waveform[left:right], dtype=np.float32)
+        valid_length = crop.size
         if crop.size < pipeline._embedding.min_num_samples:
             crop = np.pad(crop, (0, pipeline._embedding.min_num_samples - crop.size))
         crops.append(crop)
-        lengths.append(crop.size)
+        lengths.append(valid_length)
 
     vectors = []
     batch_size = min(16, int(getattr(pipeline, "embedding_batch_size", 16)))
@@ -207,7 +243,7 @@ def refine_speaker_words_with_embeddings(
         masks = np.zeros((len(batch), longest), dtype=np.float32)
         for index, crop in enumerate(batch):
             waveforms[index, 0, : len(crop)] = crop
-            masks[index, : len(crop)] = 1.0
+            masks[index, : lengths[start + index]] = 1.0
         vectors.append(
             pipeline._embedding(
                 torch.from_numpy(waveforms), masks=torch.from_numpy(masks)
@@ -215,12 +251,42 @@ def refine_speaker_words_with_embeddings(
         )
     utterance_embeddings = np.vstack(vectors)
 
+    # Speaker embeddings are unreliable for sub-second speech. Pitch remains
+    # measurable in many short greetings, so learn reference centers from
+    # longer turns and use them only when the two voices are well separated.
+    group_pitches: list[float | None] = [None] * len(groups)
+    try:
+        import librosa
+
+        for index, (crop, valid_length) in enumerate(zip(crops, lengths, strict=True)):
+            if valid_length < int(0.25 * sample_rate):
+                continue
+            f0, voiced, _ = librosa.pyin(
+                crop[:valid_length], fmin=65, fmax=350, sr=sample_rate
+            )
+            values = f0[np.asarray(voiced, dtype=bool) & np.isfinite(f0)]
+            if values.size >= 3:
+                group_pitches[index] = float(np.median(values))
+    except (ImportError, ValueError):
+        pass
+    pitch_samples: dict[str, list[float]] = {}
+    for group, pitch in zip(groups, group_pitches, strict=True):
+        if pitch is not None and group[-1].end - group[0].start >= 1.5:
+            pitch_samples.setdefault(str(group[0].speaker), []).append(pitch)
+    pitch_references = {
+        label: float(np.median(values))
+        for label, values in pitch_samples.items()
+        if values
+    }
+
     refined: list[WordTiming] = []
     overrides = 0
     confident_groups = 0
     margins: list[float] = []
     decisions: list[dict[str, object]] = []
-    for group, embedding in zip(groups, utterance_embeddings, strict=True):
+    for group, embedding, group_pitch in zip(
+        groups, utterance_embeddings, group_pitches, strict=True
+    ):
         embedding = np.asarray(embedding, dtype=np.float32)
         embedding /= max(float(np.linalg.norm(embedding)), 1e-8)
         similarities = centroids @ embedding
@@ -232,6 +298,17 @@ def refine_speaker_words_with_embeddings(
         confident = float(similarities[best]) >= 0.25 and margin >= required_margin
         selected_name = named_centroids[best] if confident else group[0].speaker
         decision_source = "call centroid" if confident else "timeline"
+        best_profile_score: float | None = None
+        if len(profiles) == 1:
+            best_profile_score = float(profiles[0] @ embedding)
+            if (
+                single_profile_anchor is not None
+                and best == single_profile_anchor
+                and best_profile_score >= 0.42
+            ):
+                confident = True
+                selected_name = profile_names[0]
+                decision_source = "enrolled profile"
         if len(profiles) >= 2:
             profile_scores = profiles @ embedding
             profile_order = np.argsort(profile_scores)[::-1]
@@ -241,6 +318,13 @@ def refine_speaker_words_with_embeddings(
                 confident = True
                 selected_name = profile_names[profile_best]
                 decision_source = "enrolled profile"
+        pitch_label = None
+        if not confident and duration <= 1.2:
+            pitch_label = _choose_pitch_label(group_pitch, pitch_references)
+            if pitch_label is not None:
+                confident = True
+                selected_name = pitch_label
+                decision_source = "call pitch"
         if confident:
             confident_groups += 1
             margins.append(margin)
@@ -258,6 +342,11 @@ def refine_speaker_words_with_embeddings(
                 "previous": group[0].speaker,
                 "similarity": round(float(similarities[best]), 4),
                 "margin": round(margin, 4),
+                "profile_similarity": (
+                    round(best_profile_score, 4) if best_profile_score is not None else None
+                ),
+                "pitch_hz": round(group_pitch, 1) if group_pitch is not None else None,
+                "pitch_candidate": pitch_label,
                 "confident": confident,
                 "source": decision_source,
             }
@@ -267,6 +356,12 @@ def refine_speaker_words_with_embeddings(
         "speaker_embedding_confident_groups": confident_groups,
         "speaker_embedding_overrides": overrides,
         "speaker_embedding_mean_margin": round(sum(margins) / len(margins), 4) if margins else None,
+        "single_profile_anchor": (
+            named_centroids[single_profile_anchor] if single_profile_anchor is not None else None
+        ),
+        "speaker_pitch_references_hz": {
+            label: round(value, 1) for label, value in pitch_references.items()
+        },
         "speaker_embedding_decisions": decisions,
     }
 

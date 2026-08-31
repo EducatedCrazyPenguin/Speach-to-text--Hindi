@@ -215,7 +215,7 @@ class AccuracyPipeline:
                 _notify(self.progress_callback, "Resumed Hindi word alignment", 0.78)
 
         if settings.diarize:
-            diarization_checkpoint = "diarized-aligned-embedding2" if settings.force_align_words else "diarized"
+            diarization_checkpoint = "diarized-aligned-embedding4" if settings.force_align_words else "diarized"
             diarized = self._load_result(checkpoint, diarization_checkpoint)
             if diarized is None:
                 def diarization_progress(message: str, value: float | None) -> None:

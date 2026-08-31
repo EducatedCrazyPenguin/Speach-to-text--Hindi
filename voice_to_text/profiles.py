@@ -112,22 +112,55 @@ def match_speaker_profiles(
     profiles = {name: load_profile(name) for name in list_profiles()}
     if not profiles:
         return {}
+    cluster_rows = [
+        np.asarray(row, dtype=np.float32).reshape(-1) for row in np.asarray(embeddings)
+    ]
+    usable_profiles = [
+        (name, np.asarray(profile, dtype=np.float32).reshape(-1))
+        for name, profile in profiles.items()
+        if cluster_rows and np.asarray(profile).size == cluster_rows[0].size
+    ]
+    if not cluster_rows or not usable_profiles:
+        return {}
+    clusters = np.vstack(cluster_rows)
+    clusters /= np.maximum(np.linalg.norm(clusters, axis=1, keepdims=True), 1e-8)
+    profile_names = [name for name, _ in usable_profiles]
+    profile_matrix = np.vstack([profile for _, profile in usable_profiles])
+    profile_matrix /= np.maximum(np.linalg.norm(profile_matrix, axis=1, keepdims=True), 1e-8)
+    scores = clusters @ profile_matrix.T
+
+    # A single enrolled person can still anchor one of the two call clusters.
+    # Requiring separation from the other cluster makes this safer than simply
+    # lowering the absolute cross-channel similarity threshold.
+    if len(profile_names) == 1 and len(cluster_rows) >= 2:
+        order = np.argsort(scores[:, 0])[::-1]
+        best, second = int(order[0]), int(order[1])
+        best_score = float(scores[best, 0])
+        if best_score >= 0.30 and best_score - float(scores[second, 0]) >= 0.08:
+            return {str(labels[best]): (profile_names[0], best_score)}
+        return {}
+
+    # Match globally so iteration order cannot claim a profile before a
+    # stronger cluster/profile pair is considered.
     matches: dict[str, tuple[str, float]] = {}
-    used: set[str] = set()
-    for label, cluster in zip(labels, np.asarray(embeddings), strict=False):
-        cluster = np.asarray(cluster, dtype=np.float32).reshape(-1)
-        cluster_norm = float(np.linalg.norm(cluster))
-        candidates = []
-        for name, profile in profiles.items():
-            if name in used or profile.size != cluster.size:
-                continue
-            score = float(np.dot(cluster, profile) / max(1e-8, cluster_norm * np.linalg.norm(profile)))
-            candidates.append((score, name))
-        if candidates:
-            score, name = max(candidates)
-            if score >= threshold:
-                matches[str(label)] = (name, score)
-                used.add(name)
+    used_clusters: set[int] = set()
+    used_profiles: set[int] = set()
+    pairs = sorted(
+        (
+            (float(scores[cluster, profile]), cluster, profile)
+            for cluster in range(scores.shape[0])
+            for profile in range(scores.shape[1])
+        ),
+        reverse=True,
+    )
+    for score, cluster, profile in pairs:
+        if score < threshold:
+            break
+        if cluster in used_clusters or profile in used_profiles:
+            continue
+        matches[str(labels[cluster])] = (profile_names[profile], score)
+        used_clusters.add(cluster)
+        used_profiles.add(profile)
     return matches
 
 

@@ -43,3 +43,20 @@ def test_profile_uses_compact_binary_credential(monkeypatch) -> None:
     assert payload.startswith(b"SPK2")
     assert len(payload) < 2560
     assert float(np.dot(expected, restored)) > 0.9999
+
+
+def test_single_profile_anchors_best_separated_call_cluster(monkeypatch) -> None:
+    monkeypatch.setattr(profiles, "list_profiles", lambda: ("Mohit",))
+    monkeypatch.setattr(
+        profiles,
+        "load_profile",
+        lambda _name: np.array([1.0, 0.0], dtype=np.float32),
+    )
+
+    matches = profiles.match_speaker_profiles(
+        ("wife-cluster", "mohit-cluster"),
+        np.array([[0.10, 0.99], [0.80, 0.20]], dtype=np.float32),
+    )
+
+    assert matches["mohit-cluster"][0] == "Mohit"
+    assert "wife-cluster" not in matches
