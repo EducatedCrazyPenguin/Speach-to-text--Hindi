@@ -4,18 +4,27 @@ import base64
 import gc
 import json
 import re
+import struct
 import zlib
 from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
 
-from .secrets import forget_token, load_token, save_token
+from .secrets import (
+    forget_token,
+    load_secret_bytes,
+    load_token,
+    save_secret_bytes,
+    save_token,
+)
 
 
 PROFILE_INDEX_TARGET = "PrivateConversationTranscriber/SpeakerProfiles"
 PROFILE_TARGET_PREFIX = "PrivateConversationTranscriber/Speaker/"
 _SAFE_NAME = re.compile(r"^[^/\\\x00-\x1f]{1,60}$")
+_PROFILE_MAGIC = b"SPK2"
+_PROFILE_HEADER = struct.Struct("<4sIf")
 
 
 def _target(name: str) -> str:
@@ -44,20 +53,39 @@ def save_profile(name: str, embedding: np.ndarray) -> None:
     if not normalized.size or not np.isfinite(normalized).all() or norm < 1e-8:
         raise ValueError("Speaker embedding is empty or invalid")
     normalized /= norm
-    payload = {
-        "dimension": int(normalized.size),
-        "data": base64.b64encode(zlib.compress(normalized.tobytes(), level=9)).decode("ascii"),
-    }
-    save_token(json.dumps(payload, separators=(",", ":")), _target(name))
+    # Windows Credential Manager accepts at most 2,560 bytes. The old Base64
+    # JSON was encoded as UTF-16 and exceeded that limit (WinError 1783).
+    # Int8 quantization keeps the credential compact with negligible cosine
+    # similarity loss for speaker matching.
+    max_abs = float(np.max(np.abs(normalized)))
+    scale = max(max_abs / 127.0, np.finfo(np.float32).tiny)
+    quantized = np.clip(np.rint(normalized / scale), -127, 127).astype(np.int8)
+    payload = _PROFILE_HEADER.pack(_PROFILE_MAGIC, int(normalized.size), scale) + quantized.tobytes()
+    save_secret_bytes(payload, _target(name))
     names = set(list_profiles())
     names.add(name.strip())
     save_token(json.dumps(sorted(names), ensure_ascii=False), PROFILE_INDEX_TARGET)
 
 
 def load_profile(name: str) -> np.ndarray:
-    payload = json.loads(load_token(_target(name)))
-    raw = zlib.decompress(base64.b64decode(payload["data"]))
-    embedding = np.frombuffer(raw, dtype="<f4").copy()
+    raw = load_secret_bytes(_target(name))
+    if raw.startswith(_PROFILE_MAGIC):
+        if len(raw) < _PROFILE_HEADER.size:
+            raise ValueError("Stored speaker profile is damaged")
+        magic, dimension, scale = _PROFILE_HEADER.unpack_from(raw)
+        quantized = np.frombuffer(raw, dtype=np.int8, offset=_PROFILE_HEADER.size)
+        if magic != _PROFILE_MAGIC or quantized.size != dimension or not np.isfinite(scale):
+            raise ValueError("Stored speaker profile is damaged")
+        embedding = quantized.astype(np.float32) * scale
+        norm = float(np.linalg.norm(embedding))
+        if norm < 1e-8:
+            raise ValueError("Stored speaker profile is damaged")
+        return embedding / norm
+
+    # Backward compatibility for any profile written by the original format.
+    payload = json.loads(raw.decode("utf-16-le"))
+    legacy = zlib.decompress(base64.b64decode(payload["data"]))
+    embedding = np.frombuffer(legacy, dtype="<f4").copy()
     if embedding.size != int(payload["dimension"]):
         raise ValueError("Stored speaker profile is damaged")
     return embedding

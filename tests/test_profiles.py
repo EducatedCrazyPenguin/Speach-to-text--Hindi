@@ -17,3 +17,29 @@ def test_profile_matching_is_one_to_one_and_thresholded(monkeypatch) -> None:
 
     assert matches["A"][0] == "Wife"
     assert matches["B"][0] == "Mum"
+
+
+def test_profile_uses_compact_binary_credential(monkeypatch) -> None:
+    stored: dict[str, bytes] = {}
+    monkeypatch.setattr(
+        profiles,
+        "save_secret_bytes",
+        lambda value, target: stored.__setitem__(target, value),
+    )
+    monkeypatch.setattr(
+        profiles,
+        "load_secret_bytes",
+        lambda target: stored.get(target, b""),
+    )
+    monkeypatch.setattr(profiles, "list_profiles", lambda: ())
+    monkeypatch.setattr(profiles, "save_token", lambda *_args, **_kwargs: None)
+
+    source = np.linspace(-1.0, 1.0, 512, dtype=np.float32)
+    profiles.save_profile("Mohit", source)
+    payload = stored[profiles._target("Mohit")]
+    restored = profiles.load_profile("Mohit")
+    expected = source / np.linalg.norm(source)
+
+    assert payload.startswith(b"SPK2")
+    assert len(payload) < 2560
+    assert float(np.dot(expected, restored)) > 0.9999
