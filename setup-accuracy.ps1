@@ -20,16 +20,16 @@ if ($LASTEXITCODE -ne 0) { throw "Accuracy runtime installation failed." }
 if ($LASTEXITCODE -ne 0) { throw "Python dependency check failed." }
 
 if ($DownloadRecommendedModels) {
-    Write-Host "Downloading Qwen3-ASR 1.7B. This uses about 4.7 GB..."
+    Write-Host "Downloading the ASR, alignment, recovery, and readable models..."
     $env:HF_HUB_DISABLE_XET = "1"
-    & $Python -m voice_to_text.preflight --ensure-qwen --ensure-alignment
+    & $Python -m voice_to_text.preflight --ensure-qwen --ensure-alignment --ensure-recovery --ensure-readable
     if ($LASTEXITCODE -ne 0) { throw "Recommended ASR model download failed." }
 }
 
 if ($DownloadReadableModel) {
-    Write-Host "Downloading the optional Qwen3.5 readable-copy model..."
+    Write-Host "Downloading the Qwen3.5 readable-copy model and isolated runtime..."
     $env:HF_HUB_DISABLE_XET = "1"
-    & $Python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.5-4B')"
+    & $Python -m voice_to_text.preflight --ensure-readable
     if ($LASTEXITCODE -ne 0) { throw "Readable-copy model download failed." }
 }
 

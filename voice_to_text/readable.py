@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from collections import Counter
-import importlib.util
-import re
-from typing import Iterable
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from typing import Iterable, Sequence
 
-from .core import TranscriptionResult
-from .metrics import normalize_text, number_accuracy
+from .core import Segment, TranscriptionResult
+from .metrics import normalize_text, numbers_match_exactly
 
 
 READABLE_MODEL = "Qwen/Qwen3.5-4B"
+READABLE_RUNTIME = Path(__file__).resolve().parents[1] / ".cache" / "readable-transformers"
 
 
 def _tokens(text: str) -> Counter[str]:
@@ -17,33 +21,87 @@ def _tokens(text: str) -> Counter[str]:
 
 
 def validate_readable_copy(source: str, rewritten: str, glossary: Iterable[str] = ()) -> bool:
-    if not rewritten.strip() or number_accuracy(source, rewritten) < 1.0:
+    if not rewritten.strip() or not numbers_match_exactly(source, rewritten):
         return False
     source_tokens = _tokens(source)
     rewritten_tokens = _tokens(rewritten)
     retained = sum(min(count, rewritten_tokens[token]) for token, count in source_tokens.items())
     introduced = sum(max(0, count - source_tokens[token]) for token, count in rewritten_tokens.items())
     source_count = max(1, sum(source_tokens.values()))
-    if retained / source_count < 0.88 or introduced / source_count > 0.12:
+    if retained / source_count < 0.85 or introduced / source_count > 0.15:
         return False
     source_normalized = normalize_text(source, canonicalize_numbers=False)
     rewritten_normalized = normalize_text(rewritten, canonicalize_numbers=False)
     for item in glossary:
         normalized = normalize_text(item, canonicalize_numbers=False)
-        if normalized and normalized in source_normalized and normalized not in rewritten_normalized:
+        if normalized and (normalized in source_normalized) != (normalized in rewritten_normalized):
             return False
     return True
+
+
+def validate_structured_turns(
+    segments: Sequence[Segment],
+    rewritten: Sequence[dict],
+    glossary: Iterable[str] = (),
+) -> tuple[str | None, ...] | None:
+    if len(rewritten) != len(segments):
+        return None
+    output: list[str | None] = []
+    for index, (segment, item) in enumerate(zip(segments, rewritten, strict=True), 1):
+        if int(item.get("id", -1)) != index:
+            return None
+        text = str(item.get("text", "")).strip()
+        output.append(text if validate_readable_copy(segment.text, text, glossary) else None)
+    return tuple(output)
 
 
 def _safe_fallback(result: TranscriptionResult) -> str:
     lines = []
     for segment in result.segments:
         prefix = f"{segment.speaker}: " if segment.speaker else ""
+        uncertainty = "[uncertain] " if segment.uncertain else ""
         text = segment.text.strip()
         if text and text[-1] not in ".!?।":
             text += "।"
-        lines.append(prefix + text)
+        lines.append(prefix + uncertainty + text)
     return "\n".join(lines).strip()
+
+
+def _run_readable_worker(segments: Sequence[Segment]) -> list[dict]:
+    if not READABLE_RUNTIME.is_dir():
+        raise RuntimeError("The isolated Qwen3.5 runtime is not installed")
+    request = {
+        "model": READABLE_MODEL,
+        "turns": [
+            {"id": index, "speaker": segment.speaker or "", "text": segment.text}
+            for index, segment in enumerate(segments, 1)
+        ],
+    }
+    READABLE_RUNTIME.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="readable-", dir=READABLE_RUNTIME.parent) as directory:
+        root = Path(directory)
+        input_path, output_path = root / "input.json", root / "output.json"
+        input_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "voice_to_text.readable_worker",
+                str(input_path),
+                str(output_path),
+                str(READABLE_RUNTIME),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        if completed.returncode != 0 or not output_path.is_file():
+            message = completed.stderr.strip()[-500:] or "Qwen3.5 readable worker failed"
+            raise RuntimeError(message)
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        return list(payload.get("turns", []))
 
 
 def generate_readable_copy(
@@ -53,47 +111,26 @@ def generate_readable_copy(
     use_local_model: bool = True,
     allow_download: bool = False,
 ) -> tuple[str, str]:
-    """Return a conservative readable copy and the method used.
-
-    The verbatim result is never modified. If the optional language model is not
-    installed/cached or changes content, a punctuation-only copy is returned.
-    """
+    """Create a separately validated readable copy; never change verbatim text."""
     fallback = _safe_fallback(result)
-    if not use_local_model or not importlib.util.find_spec("transformers"):
+    if not use_local_model:
         return fallback, "punctuation-only safeguard"
     try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(READABLE_MODEL, local_files_only=not allow_download)
-        model = AutoModelForCausalLM.from_pretrained(
-            READABLE_MODEL,
-            dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else "cpu",
-            local_files_only=not allow_download,
-        ).eval()
-        source = fallback
-        prompt = (
-            "नीचे फोन पर हुई बातचीत की शब्दशः प्रति है। केवल विराम-चिह्न और बहुत हल्का "
-            "मानक-हिंदी रूप सुधारें। कोई तथ्य, नाम, संख्या या वाक्य न जोड़ें और न हटाएँ। "
-            "केवल सुधारा हुआ पाठ लौटाएँ।\n\n" + source
-        )
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
-        inputs = {name: tensor.to(model.device) for name, tensor in inputs.items()}
-        with torch.inference_mode():
-            generated = model.generate(
-                **inputs,
-                max_new_tokens=min(2048, max(128, len(source) // 2)),
-                do_sample=False,
-                repetition_penalty=1.05,
-            )
-        new_tokens = generated[0, inputs["input_ids"].shape[1] :]
-        rewritten = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if validate_readable_copy(source, rewritten, glossary):
-            return rewritten, READABLE_MODEL
-    except Exception:
-        pass
-    return fallback, "punctuation-only safeguard"
+        rewritten = _run_readable_worker(result.segments)
+        validated = validate_structured_turns(result.segments, rewritten, glossary)
+        if validated is None:
+            return fallback, "punctuation-only safeguard (Qwen3.5 validation rejected)"
+        lines = []
+        rejected = 0
+        for segment, text in zip(result.segments, validated, strict=True):
+            prefix = f"{segment.speaker}: " if segment.speaker else ""
+            if text is None:
+                rejected += 1
+                fallback_text = segment.text.rstrip(".!?।") + "।"
+                lines.append(prefix + "[uncertain] " + fallback_text)
+            else:
+                lines.append(prefix + text)
+        method = READABLE_MODEL if not rejected else f"{READABLE_MODEL}; {rejected} rejected turn(s)"
+        return "\n".join(lines), method
+    except Exception as exc:
+        return fallback, f"punctuation-only safeguard ({type(exc).__name__})"

@@ -191,3 +191,112 @@ def force_align_hindi_words(
         provenance=result.provenance
         + ("Hindi word timestamps forced-aligned with TorchAudio MMS_FA",),
     )
+
+
+def score_hindi_candidates(
+    candidates: Sequence[tuple[float, float, str]],
+    waveform: np.ndarray,
+    device: str = "auto",
+) -> tuple[float, ...]:
+    """Return comparable MMS acoustic scores for candidate retry transcripts."""
+    if not candidates:
+        return ()
+    try:
+        import torch
+        import uroman as ur
+        from torchaudio.pipelines import MMS_FA
+    except ImportError:
+        return tuple(0.0 for _ in candidates)
+    selected = torch.device("cuda" if device != "cpu" and torch.cuda.is_available() else "cpu")
+    model = MMS_FA.get_model().to(selected).eval()
+    tokenizer = MMS_FA.get_tokenizer()
+    aligner = MMS_FA.get_aligner()
+    romanizer = ur.Uroman()
+    scores: list[float] = []
+    for start, end, text in candidates:
+        segment = Segment(
+            start,
+            end,
+            text,
+            words=proportional_word_timings(text, start, end),
+        )
+        try:
+            _, count, values = _align_segment(
+                segment,
+                waveform,
+                model,
+                tokenizer,
+                aligner,
+                romanizer,
+                torch,
+                selected,
+                context_seconds=0.15,
+            )
+            coverage = count / max(1, len(segment.words))
+            scores.append((sum(values) / len(values) if values else 0.0) * coverage)
+        except (RuntimeError, ValueError, KeyError):
+            scores.append(0.0)
+    del model, tokenizer, aligner, romanizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return tuple(scores)
+
+
+def align_hindi_candidates(
+    candidates: Sequence[tuple[float, float, str]],
+    waveform: np.ndarray,
+    device: str = "auto",
+) -> tuple[Segment, ...]:
+    """Force-align several retry candidates with one aligner model load."""
+    if not candidates:
+        return ()
+    try:
+        import torch
+        import uroman as ur
+        from torchaudio.pipelines import MMS_FA
+    except ImportError:
+        return tuple(
+            Segment(start, end, text, words=proportional_word_timings(text, start, end))
+            for start, end, text in candidates
+        )
+    selected = torch.device("cuda" if device != "cpu" and torch.cuda.is_available() else "cpu")
+    model = MMS_FA.get_model().to(selected).eval()
+    tokenizer = MMS_FA.get_tokenizer()
+    aligner = MMS_FA.get_aligner()
+    romanizer = ur.Uroman()
+    output: list[Segment] = []
+    for start, end, text in candidates:
+        original = Segment(
+            start,
+            end,
+            text,
+            words=proportional_word_timings(text, start, end),
+        )
+        try:
+            words, _, _ = _align_segment(
+                original,
+                waveform,
+                model,
+                tokenizer,
+                aligner,
+                romanizer,
+                torch,
+                selected,
+                context_seconds=0.15,
+            )
+            output.append(
+                replace(
+                    original,
+                    start=words[0].start if words else start,
+                    end=words[-1].end if words else end,
+                    words=words,
+                )
+            )
+        except (RuntimeError, ValueError, KeyError):
+            output.append(original)
+    del model, tokenizer, aligner, romanizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return tuple(output)

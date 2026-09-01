@@ -573,9 +573,14 @@ def diarize_two_speakers(
     profile_matches = match_speaker_profiles(labels, getattr(output, "speaker_embeddings", None))
     label_overrides = {label: name for label, (name, _score) in profile_matches.items()}
     enrolled_profiles = {}
+    enrolled_canonical_names: set[str] = set()
     for profile_name in list_profiles():
+        canonical_name = profile_name.casefold()
+        if canonical_name in enrolled_canonical_names:
+            continue
         try:
             enrolled_profiles[profile_name] = load_profile(profile_name)
+            enrolled_canonical_names.add(canonical_name)
         except (OSError, ValueError, KeyError):
             continue
     _notify(progress_callback, "Assigning words to speakers...", 0.98)

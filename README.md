@@ -2,7 +2,7 @@
 
 A small Windows app for turning a conversation recording into searchable text. It records from the microphone or opens an existing audio/video file, runs speech recognition locally, and writes:
 
-- a timestamped `.txt` transcript plus authoritative `.verbatim.txt` and separate `.readable.txt` copies;
+- an untouched primary `.raw.txt`, authoritative `.verbatim.txt`, compatible `.transcript.txt`, and separate `.readable.txt` copy;
 - `.srt` subtitles;
 - structured `.json` data with word timings, confidence, overlap, provenance, and audio diagnostics.
 - a readable Markdown `.md` transcript.
@@ -18,7 +18,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\setup.ps1
 ```
 
-For this RTX 4080, double-click **Run Voice to Text (Maximum Accuracy GPU).bat**; the shorter **Run Voice to Text (GPU).bat** delegates to it. It installs the GPU/accuracy runtimes, verifies CUDA and cached speaker credentials, and downloads Qwen3-ASR once when needed before opening the local app. The first SraVaani run downloads roughly 1 GB. **Run Voice to Text.bat** remains the small legacy launcher.
+For this RTX 4080, double-click **Run Voice to Text (Maximum Accuracy GPU).bat**; the shorter **Run Voice to Text (GPU).bat** delegates to it. It installs the GPU/accuracy runtimes, verifies CUDA and cached speaker credentials, and resumably downloads Qwen3-ASR, Vaani Whisper and the isolated Qwen3.5 readable-copy runtime when needed. The first complete recovery/readable setup is about 15.5 GB. **Run Voice to Text.bat** remains the small legacy launcher.
 
 On the first transcription, the selected model downloads once. Later transcription is local. Approximate model choices are:
 
@@ -36,7 +36,11 @@ System FFmpeg is not required; the installed audio decoder bundles the needed li
 4. Put names, places, family/religious terms and recurring number forms in the local vocabulary field.
 5. Click **Transcribe**.
 
+**Experimental evidence recovery** preserves the raw Qwen pass, detects suspect spans, retries shifted 6–18-second windows with Qwen and Vaani, acoustically aligns candidates, and marks unresolved wording `[uncertain]`. It is available but unchecked by default: on the corrected 2:10 Megha reference it made no accepted changes and did not improve the 46.3% baseline WER, so it failed the required two-point promotion gate. Full Vaani scored 52.1% WER on that reference and is therefore a retry source, not the default recognizer.
+
 Results go to the `transcripts` folder by default. The app deletes its temporary copy of the recording when the job finishes unless **Keep the app's local copy** is enabled; an original file selected from elsewhere is never changed. For Hindi mixed with English, try Whisper with both Auto-detect and Hindi and keep the better transcript. IndicConformer does not support English or language auto-detection.
+
+The correction editor can attach the matching original audio later, checks its duration, converts it to a private lossless WAV, and never uploads it. Mark evaluation calls **Held-out** so they are excluded from personal training. The supplied Megha correction is stored this way; `Speaker 1` is Mohit and `Speaker 0` is Wife.
 
 ## Optional: label two speakers
 
@@ -58,7 +62,7 @@ After all six clips are correct, **Run installed-model benchmark** measures WER,
 
 Qwen's own forced aligner does not support Hindi, so maximum mode now uses TorchAudio MMS_FA plus Uroman for Hindi/Hinglish word alignment. On the supplied 47.664-second sample this aligned 119 of 121 words and raised the speaker-attribution proxy against the ElevenLabs intervals from about 81.4% to 93.3%. This is still below the 95% release gate and the ElevenLabs intervals are not hand-corrected ground truth, so the result is reported rather than claimed as solved. Zero-duration or out-of-bounds timings are rejected, and words near diarization boundaries remain counted as ambiguous in JSON.
 
-The public Srota Hindi/Hinglish 0.6B candidate was also tested on the supplied sample. Its proxy WER was 77.4%, worse than Qwen's 55.6%, so it remains evaluation-only. The Hindi-specific Vaani Whisper checkpoint is wired into the benchmark, but its multi-gigabyte download was left resumable after the model host repeatedly stalled; it is not a default without a completed measurement.
+The public Srota Hindi/Hinglish 0.6B candidate was also tested on the supplied sample. Its proxy WER was 77.4%, worse than Qwen's 55.6%, so it remains evaluation-only. On the user-corrected 2:10 Megha reference, Qwen measured 46.3% WER/30.8% CER and Vaani measured 52.1% WER/40.8% CER. Encrypted Mohit/Wife profiles matched their call clusters at cosine 0.975/0.952 and produced 93.8% scored speaker attribution—much better, but still below the 95% gate. These results are reported rather than promoted, and the short approximately-95%-correct reference is not treated as proof of the global target.
 
 ## Personal adaptation
 

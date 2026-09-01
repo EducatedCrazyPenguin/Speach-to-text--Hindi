@@ -15,6 +15,7 @@ from .exports import result_from_dict, result_to_dict
 from .forced_alignment import force_align_hindi_words
 from .models import CANDIDATE_LABELS, optional_model_availability, transcribe_candidate
 from .readable import generate_readable_copy
+from .recovery import recover_transcript
 
 
 _TOKEN_PATTERN = re.compile(r"hf_[A-Za-z0-9]{8,}")
@@ -36,6 +37,7 @@ class AccuracySettings:
     use_readable_model: bool = True
     allow_model_downloads: bool = False
     force_align_words: bool = True
+    enhanced_recovery: bool = False
 
 
 def recommended_candidates(project_root: Path) -> tuple[str, ...]:
@@ -186,11 +188,12 @@ class AccuracyPipeline:
             source=source_path,
             diagnostics=combined_diagnostics,
             provenance=result.provenance + ("ASR before diarization",),
+            raw_segments=result.raw_segments or result.segments,
         )
-        self._save_result(checkpoint, "selected-asr", result)
+        self._save_result(checkpoint, "selected-asr-recovery1", result)
 
         if settings.force_align_words:
-            aligned = self._load_result(checkpoint, "forced-aligned")
+            aligned = self._load_result(checkpoint, "forced-aligned-recovery1")
             if aligned is None:
                 def alignment_progress(message: str, value: float | None) -> None:
                     _notify(self.progress_callback, message, 0.68 + 0.10 * max(0.0, min(1.0, value or 0.0)))
@@ -209,17 +212,46 @@ class AccuracyPipeline:
                         "hf_[redacted]", str(exc)
                     )
                     result = replace(result, diagnostics=alignment_diagnostics)
-                self._save_result(checkpoint, "forced-aligned", result)
+                self._save_result(checkpoint, "forced-aligned-recovery1", result)
             else:
                 result = replace(aligned, source=source_path)
                 _notify(self.progress_callback, "Resumed Hindi word alignment", 0.78)
 
+        if settings.enhanced_recovery:
+            recovered = self._load_result(checkpoint, "evidence-recovered3")
+            if recovered is None:
+                def recovery_progress(message: str, value: float | None) -> None:
+                    _notify(
+                        self.progress_callback,
+                        message,
+                        0.78 + 0.12 * max(0.0, min(1.0, value or 0.0)),
+                    )
+
+                result = recover_transcript(
+                    result,
+                    variant,
+                    device=settings.device,
+                    glossary=settings.glossary,
+                    allow_downloads=settings.allow_model_downloads,
+                    progress_callback=recovery_progress,
+                )
+                self._save_result(checkpoint, "evidence-recovered3", result)
+            else:
+                result = replace(recovered, source=source_path)
+                _notify(self.progress_callback, "Resumed evidence-grounded ASR recovery", 0.90)
+
         if settings.diarize:
-            diarization_checkpoint = "diarized-aligned-embedding4" if settings.force_align_words else "diarized"
+            diarization_checkpoint = (
+                "diarized-aligned-embedding4-recovery3"
+                if settings.force_align_words and settings.enhanced_recovery
+                else "diarized-aligned-embedding4"
+                if settings.force_align_words
+                else "diarized"
+            )
             diarized = self._load_result(checkpoint, diarization_checkpoint)
             if diarized is None:
                 def diarization_progress(message: str, value: float | None) -> None:
-                    _notify(self.progress_callback, message, 0.79 + 0.13 * max(0.0, min(1.0, value or 0.0)))
+                    _notify(self.progress_callback, message, 0.90 + 0.05 * max(0.0, min(1.0, value or 0.0)))
 
                 result = diarize_two_speakers(
                     result,
@@ -231,10 +263,10 @@ class AccuracyPipeline:
                 self._save_result(checkpoint, diarization_checkpoint, result)
             else:
                 result = replace(diarized, source=source_path)
-                _notify(self.progress_callback, "Resumed speaker identification result", 0.92)
+                _notify(self.progress_callback, "Resumed speaker identification result", 0.95)
 
         if settings.generate_readable:
-            _notify(self.progress_callback, "Creating the separate readable Hindi copy...", 0.94)
+            _notify(self.progress_callback, "Creating the separate readable Hindi copy...", 0.96)
             readable, method = generate_readable_copy(
                 result,
                 settings.glossary,

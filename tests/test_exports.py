@@ -24,6 +24,7 @@ def test_writes_utf8_transcript_subtitles_and_json(tmp_path: Path) -> None:
             Segment(0.0, 1.5, "नमस्ते", "Mohit", words=(WordTiming(0.0, 1.5, "नमस्ते", 0.9, "Mohit"),)),
             Segment(2.0, 3.5, "Hello", "Wife"),
         ),
+        raw_segments=(Segment(0.0, 1.5, "नमस्ते नमस्ते", "Mohit"),),
     )
 
     outputs = write_outputs(result, tmp_path / "out")
@@ -39,3 +40,5 @@ def test_writes_utf8_transcript_subtitles_and_json(tmp_path: Path) -> None:
     assert data["segments"][0]["words"][0]["confidence"] == 0.9
     assert outputs["verbatim"].is_file()
     assert outputs["readable"].is_file()
+    assert "नमस्ते नमस्ते" in outputs["raw"].read_text(encoding="utf-8")
+    assert data["raw_segments"][0]["text"] == "नमस्ते नमस्ते"

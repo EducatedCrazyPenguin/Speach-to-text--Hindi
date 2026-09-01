@@ -89,6 +89,10 @@ class WordTiming:
     confidence: float | None = None
     speaker: str | None = None
     overlap: bool = False
+    origin: str = "primary"
+    alternatives: tuple[str, ...] = ()
+    uncertain: bool = False
+    repetition_removed: bool = False
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,7 @@ class Segment:
     confidence: float | None = None
     overlap: bool = False
     words: tuple[WordTiming, ...] = ()
+    uncertain: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,7 @@ class TranscriptionResult:
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
     provenance: tuple[str, ...] = ()
     readable_text: str | None = None
+    raw_segments: tuple[Segment, ...] = ()
 
     @property
     def text(self) -> str:

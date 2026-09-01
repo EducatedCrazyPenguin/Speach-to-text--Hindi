@@ -10,6 +10,7 @@ corrections/
 .jobs/
 benchmarks/gold-10min/
 benchmarks/promoted.json
+benchmarks/megha-evidence*/
 training/data/
 training/*.nemo
 training/*.ckpt

@@ -8,7 +8,7 @@ if (-not (Test-Path -LiteralPath $Python)) {
 
 Set-Location -LiteralPath $ProjectRoot
 Write-Host "Installing CUDA 12.9 runtime libraries through PyTorch (large download)..."
-& $Python -m pip install torch==2.8.0+cu129 --index-url https://download.pytorch.org/whl/cu129
+& $Python -m pip install torch==2.8.0+cu129 torchvision==0.23.0+cu129 --index-url https://download.pytorch.org/whl/cu129
 Write-Host "Installing GPU inference for the AI4Bharat ONNX models..."
 & $Python -m pip install onnxruntime==1.23.2 coloredlogs
 & $Python -m pip install --force-reinstall --no-deps onnxruntime-gpu==1.23.2

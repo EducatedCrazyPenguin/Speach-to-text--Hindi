@@ -173,3 +173,64 @@ def test_corrections_are_saved_as_training_eligible_whole_call_data(
     assert saved["correction_metadata"]["training_eligible"] is True
     assert saved["correction_metadata"]["split_group"] == "call.wav"
     assert saved["segments"][0]["speaker"] == "Mum"
+
+
+def test_held_out_correction_is_excluded_from_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    transcripts = tmp_path / "transcripts"
+    corrections = tmp_path / "corrections"
+    transcripts.mkdir()
+    transcript = transcripts / "call.transcript.json"
+    transcript.write_text(
+        json.dumps({"source": "missing.wav", "duration_seconds": 3.0, "segments": [], "text": ""}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "TRANSCRIPTS_DIR", transcripts)
+    monkeypatch.setattr(app_module, "CORRECTIONS_DIR", corrections)
+    response = app.test_client().put(
+        "/api/corrections/call.transcript.json",
+        json={
+            "held_out": True,
+            "segments": [{"start": 0, "end": 2, "speaker": "Mohit", "text": "हाँ जी"}],
+        },
+    )
+    assert response.status_code == 200
+    saved = json.loads(next(corrections.glob("*.json")).read_text(encoding="utf-8"))
+    assert saved["correction_metadata"]["held_out"] is True
+    assert saved["correction_metadata"]["training_eligible"] is False
+
+
+def test_original_audio_can_be_attached_to_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    import numpy as np
+
+    transcripts = tmp_path / "transcripts"
+    corrections = tmp_path / "corrections"
+    transcripts.mkdir()
+    transcript = transcripts / "call.transcript.json"
+    transcript.write_text(
+        json.dumps({"source": "missing.wav", "duration_seconds": 2.0, "segments": [], "text": ""}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "TRANSCRIPTS_DIR", transcripts)
+    monkeypatch.setattr(app_module, "CORRECTIONS_DIR", corrections)
+    monkeypatch.setattr(
+        app_module.Transcriber,
+        "_decode_audio",
+        staticmethod(lambda _path: np.zeros(32_000, dtype=np.float32)),
+    )
+    response = app.test_client().post(
+        "/api/corrections/call.transcript.json/audio",
+        data={"audio": (BytesIO(b"audio"), "call.m4a")},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200
+    assert (corrections / "audio" / "call.transcript.wav").is_file()
+    loaded = app.test_client().get("/api/corrections/call.transcript.json").get_json()
+    assert loaded["audio_available"] is True
+    assert loaded["audio_attached"] is True

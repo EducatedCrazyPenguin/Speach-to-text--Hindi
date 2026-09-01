@@ -109,7 +109,17 @@ def match_speaker_profiles(
 ) -> dict[str, tuple[str, float]]:
     if embeddings is None:
         return {}
-    profiles = {name: load_profile(name) for name in list_profiles()}
+    profiles: dict[str, np.ndarray] = {}
+    seen_names: set[str] = set()
+    for name in list_profiles():
+        canonical = name.casefold()
+        if canonical in seen_names:
+            continue
+        try:
+            profiles[name] = load_profile(name)
+            seen_names.add(canonical)
+        except (OSError, ValueError, KeyError):
+            continue
     if not profiles:
         return {}
     cluster_rows = [
@@ -190,3 +200,49 @@ def enroll_profile(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return dimension
+
+
+def enroll_profiles_from_regions(
+    audio_path: str | Path,
+    regions_by_name: dict[str, Sequence[tuple[float, float]]],
+    hf_token: str,
+    device: str = "auto",
+) -> dict[str, int]:
+    """Create private profiles from user-verified, non-overlapping call regions."""
+    from .core import Transcriber
+    from .diarization import _load_diarization_pipeline
+
+    waveform = Transcriber._decode_audio(Path(audio_path))
+    pipeline, torch, _ = _load_diarization_pipeline(hf_token, device, None)
+    dimensions: dict[str, int] = {}
+    for name, regions in regions_by_name.items():
+        clips = []
+        for start, end in regions:
+            left = max(0, int(float(start) * 16_000))
+            right = min(waveform.size, int(float(end) * 16_000))
+            if right - left >= int(0.40 * 16_000):
+                clips.append(np.asarray(waveform[left:right], dtype=np.float32))
+        speech_seconds = sum(clip.size for clip in clips) / 16_000
+        if speech_seconds < 10.0:
+            raise ValueError(f"{name} needs at least 10 seconds of verified speech")
+        separator = np.zeros(int(0.12 * 16_000), dtype=np.float32)
+        joined = np.concatenate(
+            [piece for clip in clips for piece in (clip, separator)]
+        )
+        audio = {
+            "waveform": torch.from_numpy(joined).unsqueeze(0),
+            "sample_rate": 16_000,
+        }
+        output = pipeline(audio, num_speakers=1)
+        embeddings = getattr(output, "speaker_embeddings", None)
+        if embeddings is None or len(embeddings) != 1:
+            raise RuntimeError(f"The speaker model did not return a usable {name} embedding")
+        vector = np.asarray(embeddings[0])
+        save_profile(name, vector)
+        dimensions[name] = int(vector.size)
+        del output, audio
+    del pipeline
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return dimensions

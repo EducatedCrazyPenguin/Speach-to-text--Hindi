@@ -60,3 +60,18 @@ def test_single_profile_anchors_best_separated_call_cluster(monkeypatch) -> None
 
     assert matches["mohit-cluster"][0] == "Mohit"
     assert "wife-cluster" not in matches
+
+
+def test_profile_matching_ignores_case_only_duplicate_names(monkeypatch) -> None:
+    monkeypatch.setattr(profiles, "list_profiles", lambda: ("Mohit", "Wife", "mohit"))
+    monkeypatch.setattr(
+        profiles,
+        "load_profile",
+        lambda name: np.array([1.0, 0.0], dtype=np.float32)
+        if name.casefold() == "mohit"
+        else np.array([0.0, 1.0], dtype=np.float32),
+    )
+    matches = profiles.match_speaker_profiles(
+        ("A", "B"), np.array([[0.99, 0.01], [0.01, 0.99]], dtype=np.float32)
+    )
+    assert {value[0] for value in matches.values()} == {"Mohit", "Wife"}

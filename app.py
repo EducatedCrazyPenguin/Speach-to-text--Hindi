@@ -32,6 +32,7 @@ from voice_to_text.accuracy import (
     promoted_defaults,
     recommended_candidates,
 )
+from voice_to_text.audio import write_pcm16_wav
 from voice_to_text.benchmark import (
     benchmark_root,
     load_manifest,
@@ -147,6 +148,7 @@ HTML = r"""<!doctype html>
       <div><label for="primaryCandidate">Primary accuracy model</label><select id="primaryCandidate"></select></div>
       <div><label for="secondaryCandidate">Second model</label><select id="secondaryCandidate"><option value="">None until benchmark promotes it</option></select></div>
       <div class="wide"><label><input id="consensus" type="checkbox" style="width:auto;min-height:auto"> Use two-model consensus (enable only after benchmark improvement)</label></div>
+      <div class="wide"><label><input id="enhancedRecovery" type="checkbox" style="width:auto;min-height:auto"> Experimental evidence recovery for repeated or unclear sentences (not promoted)</label></div>
       <div class="wide"><label><input id="readable" type="checkbox" checked style="width:auto;min-height:auto"> Also create a separate readable standard-Hindi copy</label></div>
       <details><summary>Fast/legacy and advanced controls</summary><div class="grid" style="margin-top:12px">
       <div><label for="engine">Legacy engine</label><select id="engine"></select></div>
@@ -299,6 +301,7 @@ $('transcribe').addEventListener('click', async () => {
   form.append('audio', recordedBlob || file, recordedBlob ? 'browser-recording.webm' : file.name);
   for (const id of ['preset','audioMode','primaryCandidate','secondaryCandidate','engine','language','model','device','prompt','speaker1','speaker2','token']) form.append(id, $(id).value);
   form.append('consensus', $('consensus').checked ? 'true' : 'false');
+  form.append('enhanced_recovery', $('enhancedRecovery').checked ? 'true' : 'false');
   form.append('readable', $('readable').checked ? 'true' : 'false');
   form.append('diarize', $('diarize').checked ? 'true' : 'false');
   form.append('remember_token', $('rememberToken').checked ? 'true' : 'false');
@@ -428,6 +431,7 @@ def _run_job(job_id: str, source: Path, settings: dict[str, str]) -> None:
                         generate_readable=settings.get("readable", "true") == "true",
                         use_readable_model=True,
                         allow_model_downloads=False,
+                        enhanced_recovery=settings.get("enhanced_recovery", "false") == "true",
                     ),
                     checkpoint_dir=JOBS_DIR / job_id / "stages",
                 )
@@ -581,6 +585,7 @@ def start_transcription():
         "primary_candidate": primary_candidate,
         "secondary_candidate": secondary_candidate,
         "consensus": request.form.get("consensus", "false"),
+        "enhanced_recovery": request.form.get("enhanced_recovery", "false"),
         "readable": request.form.get("readable", "true"),
         "engine": engine,
         "language": language,
@@ -880,6 +885,22 @@ def _correction_path(name: str) -> Path:
     return CORRECTIONS_DIR / f"{Path(name).stem}.corrected.json"
 
 
+def _correction_audio_path(name: str) -> Path:
+    return CORRECTIONS_DIR / "audio" / f"{Path(name).stem}.wav"
+
+
+def _retained_correction_audio(name: str, payload: dict) -> Path | None:
+    attached = _correction_audio_path(name)
+    if attached.is_file():
+        return attached
+    source = Path(payload.get("source", ""))
+    try:
+        retained = source.is_file() and source.resolve().is_relative_to(RECORDINGS_DIR.resolve())
+    except (OSError, RuntimeError):
+        retained = False
+    return source if retained else None
+
+
 @app.get("/correct/<path:name>")
 def correction_editor(name: str):
     try:
@@ -899,9 +920,47 @@ def correction_data(name: str):
         return jsonify(error=str(exc)), 404
     path = _correction_path(name)
     payload = json.loads((path if path.is_file() else transcript_path).read_text(encoding="utf-8"))
-    source = Path(payload["source"])
-    payload["audio_available"] = source.is_file() and source.resolve().is_relative_to(RECORDINGS_DIR.resolve())
+    payload["audio_available"] = _retained_correction_audio(name, payload) is not None
+    payload["audio_attached"] = _correction_audio_path(name).is_file()
     return jsonify(payload)
+
+
+@app.post("/api/corrections/<path:name>/audio")
+def attach_correction_audio(name: str):
+    """Attach a lossless local listening copy to an existing transcript."""
+    import json
+
+    try:
+        transcript_path = _transcript_json_path(name)
+    except (ValueError, FileNotFoundError) as exc:
+        return jsonify(error=str(exc)), 404
+    upload = request.files.get("audio")
+    if upload is None or not upload.filename:
+        return jsonify(error="Choose the original recording first"), 400
+    original = json.loads(transcript_path.read_text(encoding="utf-8"))
+    expected_duration = float(original.get("duration_seconds", 0.0))
+    audio_dir = CORRECTIONS_DIR / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(secure_filename(upload.filename)).suffix.lower() or ".audio"
+    temporary = audio_dir / f".{Path(name).stem}-{uuid.uuid4().hex}{suffix}"
+    try:
+        upload.save(temporary)
+        waveform = Transcriber._decode_audio(temporary)
+        actual_duration = len(waveform) / 16_000
+        tolerance = max(0.75, expected_duration * 0.01)
+        if expected_duration and abs(actual_duration - expected_duration) > tolerance:
+            return jsonify(
+                error=(
+                    f"This audio is {actual_duration:.2f}s, but the transcript is "
+                    f"{expected_duration:.2f}s. Attach the matching original call."
+                )
+            ), 400
+        destination = write_pcm16_wav(_correction_audio_path(name), waveform)
+        return jsonify(ok=True, audio=destination.name, duration_seconds=actual_duration)
+    except Exception as exc:
+        return jsonify(error=_friendly_error(exc)), 400
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @app.put("/api/corrections/<path:name>")
@@ -931,13 +990,14 @@ def update_correction(name: str):
                 "overlap": bool(item.get("overlap", False)),
             })
         last_start = start
+    held_out = bool(request_payload.get("held_out", False))
     payload = {
         **original,
         "segments": validated,
         "text": " ".join(item["text"] for item in validated),
         "correction_metadata": {
-            "training_eligible": True,
-            "held_out": False,
+            "training_eligible": not held_out,
+            "held_out": held_out,
             "split_group": Path(original["source"]).name,
             "verified": True,
             "tags": {
@@ -962,10 +1022,12 @@ def correction_audio(name: str):
         path = _transcript_json_path(name)
     except (ValueError, FileNotFoundError):
         return Response("Not found", status=404)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    source = Path(payload["source"]).resolve()
-    if not source.is_file() or not source.is_relative_to(RECORDINGS_DIR.resolve()):
+    correction = _correction_path(name)
+    payload = json.loads((correction if correction.is_file() else path).read_text(encoding="utf-8"))
+    source = _retained_correction_audio(name, payload)
+    if source is None:
         return Response("The local audio copy was not retained", status=404)
+    source = source.resolve()
     return send_from_directory(source.parent, source.name)
 
 

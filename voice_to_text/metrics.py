@@ -128,6 +128,12 @@ def number_accuracy(reference: str, hypothesis: str) -> float:
     )
 
 
+def numbers_match_exactly(reference: str, hypothesis: str) -> bool:
+    """Require the same normalized numeric values, including no added values."""
+    pattern = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+    return pattern.findall(normalize_text(reference)) == pattern.findall(normalize_text(hypothesis))
+
+
 def name_accuracy(reference: str, hypothesis: str, names: Iterable[str]) -> float:
     reference_normalized = normalize_text(reference, canonicalize_numbers=False)
     hypothesis_normalized = normalize_text(hypothesis, canonicalize_numbers=False)
@@ -145,12 +151,14 @@ def speaker_attribution_accuracy(
     for expected in reference:
         if not expected.speaker:
             continue
-        duration = max(0.001, expected.end - expected.start)
-        scored += duration
         for actual in hypothesis:
             overlap = max(0.0, min(expected.end, actual.end) - max(expected.start, actual.start))
-            if overlap and actual.speaker == expected.speaker:
-                correct += overlap
+            if overlap:
+                # Missing ASR coverage belongs in WER, not speaker attribution.
+                # Score identity only where a hypothesis actually emitted speech.
+                scored += overlap
+                if actual.speaker == expected.speaker:
+                    correct += overlap
     return correct / scored if scored else 1.0
 
 

@@ -23,8 +23,9 @@ if errorlevel 1 (
   if errorlevel 1 goto :failed
 )
 
-echo Checking GPU, local models, and saved speaker credentials...
-".venv\Scripts\python.exe" -m voice_to_text.preflight --require-gpu --ensure-qwen --ensure-alignment
+echo Checking GPU, recovery models, readable model, and saved speaker credentials...
+echo First use may download about 15.5 GB; downloads resume automatically.
+".venv\Scripts\python.exe" -m voice_to_text.preflight --require-gpu --ensure-qwen --ensure-alignment --ensure-recovery --ensure-readable
 if errorlevel 1 goto :failed
 
 echo Starting Maximum Local Accuracy mode...
